@@ -1,0 +1,679 @@
+// Organo Healers OS - database schema
+//
+// Design notes
+// - Proformas, invoices (and later quotations / credit notes) share ONE document
+//   model discriminated by `type`. They have identical structure (groups -> items,
+//   totals, snapshots), so a single renderer, calculator and set of services
+//   handles all of them. Conversion creates a NEW document that points back to
+//   its source via `sourceDocumentId`; the proforma is never mutated into an invoice.
+// - Every document stores customer + business snapshots and every item stores a
+//   product snapshot, so later catalog / settings edits never rewrite history.
+// - Money is Decimal(14,2); quantities are Decimal(12,3).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "relationJoins"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [pg_trgm]
+}
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+model Role {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String
+  permissions String[]
+  users       User[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  phone        String?
+  passwordHash String
+  active       Boolean   @default(true)
+  roleId       String
+  role         Role      @relation(fields: [roleId], references: [id])
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  documentsCreated  Document[]          @relation("DocumentCreatedBy")
+  followUpsAssigned FollowUp[]          @relation("FollowUpAssignee")
+  followUpsCreated  FollowUp[]          @relation("FollowUpCreator")
+  activities        Activity[]
+  payments          Payment[]
+  movements         InventoryMovement[]
+  messages          MessageLog[]
+  priceChanges      ProductPrice[]
+}
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+// Single-row table (id = "default"). Everything business-specific lives here,
+// never hardcoded in UI.
+model BusinessSettings {
+  id                  String   @id @default("default")
+  businessName        String
+  legalName           String?
+  tagline             String?
+  logoUrl             String?
+  gstNumber           String?
+  addressLine1        String?
+  addressLine2        String?
+  city                String?
+  state               String?
+  postalCode          String?
+  phone               String?
+  email               String?
+  website             String?
+
+  upiId               String?
+  upiPhone            String?
+  bankName            String?
+  accountName         String?
+  accountNumber       String?
+  ifsc                String?
+  paymentInstructions String?
+
+  invoicePrefix       String   @default("INV")
+  proformaPrefix      String   @default("PI")
+  numberPadding       Int      @default(4)
+  invoiceStartNumber  Int      @default(1)
+  proformaStartNumber Int      @default(1)
+  defaultTaxRate      Decimal  @default(0) @db.Decimal(5, 2)
+  pricesIncludeTax    Boolean  @default(false)
+  roundToRupee        Boolean  @default(true)
+  invoiceDueDays      Int      @default(7)
+  proformaValidDays   Int      @default(15)
+  defaultNotes        String?
+  defaultTerms        String?
+  paymentTerms        String?
+  invoiceFooter       String?
+  defaultLayout       Json?
+  emailSenderName     String?
+  emailReplyTo        String?
+  salespersonName     String?
+
+  updatedAt           DateTime @updatedAt
+}
+
+// Per-type, per-year counters. Incremented with INSERT ... ON CONFLICT ... RETURNING
+// inside the document transaction so concurrent requests never share a number.
+model DocumentSequence {
+  id        String       @id @default(cuid())
+  type      DocumentType
+  year      Int
+  lastValue Int          @default(0)
+  updatedAt DateTime     @updatedAt
+
+  @@unique([type, year])
+}
+
+model InvoiceTemplate {
+  id        String     @id @default(cuid())
+  key       String     @unique
+  name      String
+  config    Json
+  isDefault Boolean    @default(false)
+  active    Boolean    @default(true)
+  documents Document[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model MessageTemplate {
+  id           String          @id @default(cuid())
+  channel      MessageChannel
+  key          String
+  name         String
+  subject      String?
+  body         String
+  documentType DocumentType?
+  isDefault    Boolean         @default(false)
+  active       Boolean         @default(true)
+  followUps    FollowUp[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@unique([channel, key])
+}
+
+// ─── Customers ───────────────────────────────────────────────────────────────
+
+model Customer {
+  id              String         @id @default(cuid())
+  name            String
+  companyName     String?
+  phone           String?        // E.164, e.g. +919992223310
+  email           String?
+  gstin           String?
+  billingAddress  String?
+  shippingAddress String?
+  city            String?
+  status          CustomerStatus @default(LEAD)
+  source          String?
+  notes           String?
+  tags            String[]
+  lastContactAt   DateTime?
+  archivedAt      DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  contacts   CustomerContact[]
+  documents  Document[]
+  followUps  FollowUp[]
+  activities Activity[]
+  payments   Payment[]
+  messages   MessageLog[]
+
+  @@index([phone])
+  @@index([email])
+  @@index([status])
+  @@index([createdAt])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Customer_name_trgm_idx")
+}
+
+model CustomerContact {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  name       String
+  role       String?
+  phone      String?
+  email      String?
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+  @@index([phone])
+}
+
+// ─── Catalog & inventory ─────────────────────────────────────────────────────
+
+model Category {
+  id        String      @id @default(cuid())
+  name      String
+  slug      String      @unique
+  kind      ProductKind @default(OTHER)
+  parentId  String?
+  parent    Category?   @relation("CategoryTree", fields: [parentId], references: [id])
+  children  Category[]  @relation("CategoryTree")
+  sortOrder Int         @default(0)
+  active    Boolean     @default(true)
+  products  Product[]
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+}
+
+// One table for every kind of sellable thing. Kind-specific fields (plant bag size,
+// pot dimensions, service type...) live in `attributes`, validated per kind by the
+// shared zod schemas. This keeps the catalog import-ready without a table per type.
+model Product {
+  id                String      @id @default(cuid())
+  sku               String      @unique
+  name              String
+  description       String?
+  kind              ProductKind
+  categoryId        String?
+  category          Category?   @relation(fields: [categoryId], references: [id])
+  unit              String      @default("pc")
+  mrp               Decimal?    @db.Decimal(14, 2)
+  sellingPrice      Decimal     @db.Decimal(14, 2)
+  costPrice         Decimal?    @db.Decimal(14, 2)
+  taxRate           Decimal     @default(0) @db.Decimal(5, 2)
+  hsnCode           String?
+  trackStock        Boolean     @default(true)
+  stockQuantity     Decimal     @default(0) @db.Decimal(12, 3)
+  lowStockThreshold Decimal?    @db.Decimal(12, 3)
+  imageUrl          String?
+  attributes        Json        @default("{}")
+  active            Boolean     @default(true)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  prices    ProductPrice[]
+  movements InventoryMovement[]
+  items     DocumentItem[]
+
+  @@index([categoryId])
+  @@index([kind])
+  @@index([active])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Product_name_trgm_idx")
+}
+
+// Price history. Seeded with every rate observed in historical estimates so
+// differing past prices are preserved instead of silently overwritten.
+model ProductPrice {
+  id           String      @id @default(cuid())
+  productId    String
+  product      Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  mrp          Decimal?    @db.Decimal(14, 2)
+  sellingPrice Decimal?    @db.Decimal(14, 2)
+  costPrice    Decimal?    @db.Decimal(14, 2)
+  source       PriceSource
+  sourceRef    String?
+  note         String?
+  effectiveAt  DateTime    @default(now())
+  userId       String?
+  user         User?       @relation(fields: [userId], references: [id])
+
+  @@index([productId, effectiveAt])
+}
+
+model InventoryMovement {
+  id           String       @id @default(cuid())
+  productId    String
+  product      Product      @relation(fields: [productId], references: [id])
+  type         MovementType
+  quantity     Decimal      @db.Decimal(12, 3) // signed: + in, - out
+  balanceAfter Decimal      @db.Decimal(12, 3)
+  unitCost     Decimal?     @db.Decimal(14, 2)
+  reason       String?
+  documentId   String?
+  document     Document?    @relation(fields: [documentId], references: [id])
+  userId       String?
+  user         User?        @relation(fields: [userId], references: [id])
+  createdAt    DateTime     @default(now())
+
+  @@index([productId, createdAt])
+  @@index([documentId])
+  @@index([createdAt])
+}
+
+// ─── Documents (proforma, invoice, ...) ──────────────────────────────────────
+
+model Document {
+  id               String         @id @default(cuid())
+  type             DocumentType
+  number           String         @unique
+  status           DocumentStatus @default(DRAFT)
+  publicToken      String         @unique
+  title            String?
+
+  customerId       String
+  customer         Customer       @relation(fields: [customerId], references: [id])
+  customerSnapshot Json
+  businessSnapshot Json
+
+  issueDate        DateTime       @default(now())
+  dueDate          DateTime?
+  validUntil       DateTime?
+  currency         String         @default("INR")
+
+  subtotal         Decimal        @default(0) @db.Decimal(14, 2)
+  itemDiscountTotal Decimal       @default(0) @db.Decimal(14, 2)
+  discountType     DiscountType?
+  discountValue    Decimal?       @db.Decimal(14, 2)
+  discountTotal    Decimal        @default(0) @db.Decimal(14, 2)
+  taxableTotal     Decimal        @default(0) @db.Decimal(14, 2)
+  taxTotal         Decimal        @default(0) @db.Decimal(14, 2)
+  roundOff         Decimal        @default(0) @db.Decimal(14, 2)
+  grandTotal       Decimal        @default(0) @db.Decimal(14, 2)
+  amountPaid       Decimal        @default(0) @db.Decimal(14, 2)
+  balanceDue       Decimal        @default(0) @db.Decimal(14, 2)
+
+  notes            String?
+  terms            String?
+  paymentTerms     String?
+  footer           String?
+  layout           Json           // columns, section visibility, header overrides
+  templateId       String?
+  template         InvoiceTemplate? @relation(fields: [templateId], references: [id])
+
+  sourceDocumentId String?
+  sourceDocument   Document?      @relation("Conversion", fields: [sourceDocumentId], references: [id])
+  derivedDocuments Document[]     @relation("Conversion")
+
+  createdById      String?
+  createdBy        User?          @relation("DocumentCreatedBy", fields: [createdById], references: [id])
+
+  sentAt           DateTime?
+  viewedAt         DateTime?
+  acceptedAt       DateTime?
+  convertedAt      DateTime?
+  paidAt           DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  groups     DocumentGroup[]
+  items      DocumentItem[]
+  payments   Payment[]
+  activities Activity[]
+  views      DocumentView[]
+  followUps  FollowUp[]
+  movements  InventoryMovement[]
+  messages   MessageLog[]
+
+  @@index([type, status])
+  @@index([customerId])
+  @@index([createdAt])
+  @@index([issueDate])
+  @@index([sourceDocumentId])
+}
+
+model DocumentGroup {
+  id         String         @id @default(cuid())
+  documentId String
+  document   Document       @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  name       String         // snapshot, e.g. "FIRST FLOOR (terrace garden)"
+  notes      String?
+  position   Int
+  subtotal   Decimal        @default(0) @db.Decimal(14, 2)
+  items      DocumentItem[]
+
+  @@index([documentId, position])
+}
+
+model DocumentItem {
+  id             String        @id @default(cuid())
+  documentId     String
+  document       Document      @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  groupId        String
+  group          DocumentGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  position       Int
+
+  productId      String?
+  product        Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+  // Product snapshot at the time of the document
+  name           String
+  sku            String?
+  description    String?
+  unit           String?
+  kind           ProductKind?
+  attributes     Json          @default("{}")
+
+  quantity       Decimal       @db.Decimal(12, 3)
+  mrp            Decimal?      @db.Decimal(14, 2)
+  rate           Decimal       @db.Decimal(14, 2)
+  discountType   DiscountType?
+  discountValue  Decimal?      @db.Decimal(14, 2)
+  taxRate        Decimal       @default(0) @db.Decimal(5, 2)
+
+  lineSubtotal   Decimal       @db.Decimal(14, 2) // qty x rate
+  discountAmount Decimal       @default(0) @db.Decimal(14, 2)
+  taxableAmount  Decimal       @db.Decimal(14, 2)
+  taxAmount      Decimal       @default(0) @db.Decimal(14, 2)
+  total          Decimal       @db.Decimal(14, 2)
+
+  @@index([documentId])
+  @@index([groupId, position])
+  @@index([productId])
+}
+
+model DocumentView {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  ipHash     String?
+  userAgent  String?
+  viewedAt   DateTime @default(now())
+
+  @@index([documentId, viewedAt])
+}
+
+model Payment {
+  id           String        @id @default(cuid())
+  documentId   String
+  document     Document      @relation(fields: [documentId], references: [id])
+  customerId   String
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  amount       Decimal       @db.Decimal(14, 2)
+  method       PaymentMethod
+  reference    String?
+  notes        String?
+  paidAt       DateTime
+  recordedById String?
+  recordedBy   User?         @relation(fields: [recordedById], references: [id])
+  voidedAt     DateTime?
+  createdAt    DateTime      @default(now())
+
+  @@index([documentId])
+  @@index([customerId])
+  @@index([paidAt])
+}
+
+// ─── CRM ─────────────────────────────────────────────────────────────────────
+
+model FollowUp {
+  id           String           @id @default(cuid())
+  customerId   String
+  customer     Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  documentId   String?
+  document     Document?        @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  title        String
+  notes        String?
+  channel      FollowUpChannel  @default(CALL)
+  dueAt        DateTime
+  reminderAt   DateTime?
+  priority     FollowUpPriority @default(MEDIUM)
+  status       FollowUpStatus   @default(PENDING)
+  outcome      String?
+  templateId   String?
+  template     MessageTemplate? @relation(fields: [templateId], references: [id])
+  assignedToId String?
+  assignedTo   User?            @relation("FollowUpAssignee", fields: [assignedToId], references: [id])
+  createdById  String?
+  createdBy    User?            @relation("FollowUpCreator", fields: [createdById], references: [id])
+  completedAt  DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([status, dueAt])
+  @@index([customerId])
+  @@index([assignedToId])
+  @@index([dueAt])
+}
+
+// Customer timeline + audit trail in one append-only table.
+model Activity {
+  id          String       @id @default(cuid())
+  type        ActivityType
+  description String
+  customerId  String?
+  customer    Customer?    @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  documentId  String?
+  document    Document?    @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  entityType  String?
+  entityId    String?
+  metadata    Json?
+  userId      String?
+  user        User?        @relation(fields: [userId], references: [id])
+  createdAt   DateTime     @default(now())
+
+  @@index([customerId, createdAt])
+  @@index([documentId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([type])
+}
+
+model MessageLog {
+  id                String         @id @default(cuid())
+  channel           MessageChannel
+  status            MessageStatus
+  to                String
+  subject           String?
+  body              String
+  providerMessageId String?
+  error             String?
+  documentId        String?
+  document          Document?      @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  customerId        String?
+  customer          Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  userId            String?
+  user              User?          @relation(fields: [userId], references: [id])
+  createdAt         DateTime       @default(now())
+
+  @@index([documentId])
+  @@index([customerId])
+  @@index([createdAt])
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum DocumentType {
+  PROFORMA
+  INVOICE
+  QUOTATION
+  CREDIT_NOTE
+}
+
+enum DocumentStatus {
+  DRAFT
+  SENT
+  VIEWED
+  NEGOTIATING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum CustomerStatus {
+  LEAD
+  QUOTED
+  PROFORMA_SENT
+  NEGOTIATING
+  CONFIRMED
+  INVOICE_SENT
+  PARTIALLY_PAID
+  PAID
+  COMPLETED
+  INACTIVE
+}
+
+enum ProductKind {
+  PLANT
+  POT
+  MATERIAL
+  SERVICE
+  OTHER
+}
+
+enum PriceSource {
+  SEED
+  CATALOG
+  HISTORICAL_DOCUMENT
+  MANUAL
+  IMPORT
+}
+
+enum MovementType {
+  OPENING
+  PURCHASE
+  SALE
+  ADJUSTMENT
+  RETURN
+  DAMAGE
+  MANUAL_CORRECTION
+}
+
+enum DiscountType {
+  PERCENT
+  AMOUNT
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  BANK_TRANSFER
+  CHEQUE
+  OTHER
+}
+
+enum FollowUpStatus {
+  PENDING
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
+enum FollowUpPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum FollowUpChannel {
+  CALL
+  WHATSAPP
+  EMAIL
+  MEETING
+  VISIT
+  OTHER
+}
+
+enum MessageChannel {
+  WHATSAPP
+  EMAIL
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  FAILED
+  OPENED // WhatsApp: chat opened in browser. We cannot know if the user pressed send.
+}
+
+enum ActivityType {
+  CUSTOMER_CREATED
+  CUSTOMER_UPDATED
+  PROFORMA_CREATED
+  PROFORMA_EDITED
+  PROFORMA_SENT
+  PROFORMA_VIEWED
+  PROFORMA_STATUS_CHANGED
+  PROFORMA_CONVERTED
+  INVOICE_CREATED
+  INVOICE_EDITED
+  INVOICE_SENT
+  INVOICE_VIEWED
+  INVOICE_STATUS_CHANGED
+  INVOICE_CANCELLED
+  WHATSAPP_OPENED
+  WHATSAPP_SENT
+  EMAIL_SENT
+  EMAIL_FAILED
+  FOLLOWUP_CREATED
+  FOLLOWUP_UPDATED
+  FOLLOWUP_COMPLETED
+  CALL
+  MEETING
+  NOTE
+  PAYMENT_RECEIVED
+  PAYMENT_VOIDED
+  PAYMENT_REMINDER
+  PRODUCT_CREATED
+  PRODUCT_UPDATED
+  PRODUCT_PRICE_CHANGED
+  STOCK_CHANGED
+  SETTINGS_UPDATED
+}
+
+// Small binary assets (logo, product photos) stored in Postgres so the app needs
+// no separate file storage. Served via /api/public/assets/:id.
+model Asset {
+  id        String   @id @default(cuid())
+  filename  String
+  mimeType  String
+  size      Int
+  data      Bytes
+  purpose   String   @default("upload")
+  createdAt DateTime @default(now())
+}
