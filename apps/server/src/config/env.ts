@@ -13,6 +13,8 @@ const envSchema = z.object({
   BREVO_SENDER_EMAIL: z.string().optional().transform((v) => v || undefined),
   BREVO_SENDER_NAME: z.string().optional().transform((v) => v || undefined),
   PUPPETEER_EXECUTABLE_PATH: z.string().optional(),
+  /** Number of proxies in front of the API. Vercel (rewrite) + Render = 2, so req.ip is the visitor. */
+  TRUST_PROXY: z.coerce.number().int().min(0).max(5).default(1),
 });
 
 const parsed = envSchema.safeParse(process.env);
