@@ -35,15 +35,36 @@ function geistFontCss(): string {
   return fontCss;
 }
 
+/*
+ * Memory: Chromium is the biggest thing in this process (~150-250 MB while open),
+ * and small hosts have 512 MB. So it is started only when a PDF is needed, PDFs
+ * render one at a time, and the browser is closed after a minute with no work.
+ */
+const IDLE_CLOSE_MS = 60_000;
+const LOW_MEMORY_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--font-render-hinting=none",
+  "--disable-gpu",
+  "--disable-extensions",
+  "--disable-background-networking",
+  "--disable-default-apps",
+  "--disable-sync",
+  "--no-first-run",
+  "--no-zygote",
+  "--mute-audio",
+  "--js-flags=--max-old-space-size=128",
+];
+
 let browserPromise: Promise<Browser> | null = null;
+let idleTimer: NodeJS.Timeout | null = null;
+let queue: Promise<unknown> = Promise.resolve();
+
 function getBrowser(): Promise<Browser> {
   if (!browserPromise) {
     browserPromise = puppeteer
-      .launch({
-        headless: true,
-        executablePath: env.PUPPETEER_EXECUTABLE_PATH,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
-      })
+      .launch({ headless: true, executablePath: env.PUPPETEER_EXECUTABLE_PATH, args: LOW_MEMORY_ARGS })
       .then((b) => {
         b.on("disconnected", () => {
           browserPromise = null;
@@ -56,6 +77,26 @@ function getBrowser(): Promise<Browser> {
       });
   }
   return browserPromise;
+}
+
+function scheduleIdleClose() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    void closeBrowser();
+  }, IDLE_CLOSE_MS);
+  idleTimer.unref();
+}
+
+/** Runs PDF jobs one after another so only one page is ever open. */
+function serial<T>(job: () => Promise<T>): Promise<T> {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  const run = queue.then(job, job);
+  queue = run.catch(() => undefined).finally(scheduleIdleClose);
+  return run;
 }
 
 export async function closeBrowser(): Promise<void> {
@@ -98,6 +139,10 @@ function escapeHtml(s: string) {
 
 export async function generateDocumentPdf(doc: RenderableDocument): Promise<Buffer> {
   const html = await renderDocumentHtml(doc);
+  return serial(() => printPdf(doc, html));
+}
+
+async function printPdf(doc: RenderableDocument, html: string): Promise<Buffer> {
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
