@@ -3,17 +3,21 @@ import cors from "cors";
 import express, { Router } from "express";
 import helmet from "helmet";
 import { pinoHttp } from "pino-http";
-import { corsOrigins } from "./config/env";
+import { corsOrigins, env } from "./config/env";
 import { logger } from "./lib/logger";
 import { errorHandler, notFound } from "./middleware/error";
 import { loadUser, requireAuth } from "./middleware/auth";
 import { apiLimiter } from "./middleware/rateLimit";
 import { routes } from "./routes";
 
+/** Express rewrites req.url inside routers; originalUrl keeps the /api/... path for logs. */
+const fullUrl = (req: { url?: string; originalUrl?: string }) => req.originalUrl ?? req.url ?? "";
+
 export function createApp() {
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", 1);
+  // Rate limits and view tracking key on req.ip; it must be the visitor, not a proxy.
+  app.set("trust proxy", env.TRUST_PROXY);
 
   app.use(helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
   app.use(
@@ -31,11 +35,11 @@ export function createApp() {
         autoLogging: { ignore: (req) => req.url === "/api/health" },
         // One concise line per request; headers (and cookies) are never logged.
         serializers: {
-          req: (req: { method: string; url: string }) => ({ method: req.method, url: req.url }),
+          req: (req: { method: string; url: string; raw?: { originalUrl?: string } }) => ({ method: req.method, url: req.raw?.originalUrl ?? req.url }),
           res: (res: { statusCode: number }) => ({ status: res.statusCode }),
         },
-        customSuccessMessage: (req, res, ms) => `${req.method} ${req.url} ${res.statusCode} ${Math.round(ms)}ms`,
-        customErrorMessage: (req, res) => `${req.method} ${req.url} ${res.statusCode}`,
+        customSuccessMessage: (req, res, ms) => `${req.method} ${fullUrl(req)} ${res.statusCode} ${Math.round(ms)}ms`,
+        customErrorMessage: (req, res) => `${req.method} ${fullUrl(req)} ${res.statusCode}`,
         customAttributeKeys: { req: "req", res: "res", responseTime: "ms" },
         quietReqLogger: true,
       }),
