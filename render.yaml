@@ -1,0 +1,39 @@
+# Render Blueprint: New > Blueprint > pick this repo.
+# Region matches the Neon database (ap-southeast-1, Singapore) so queries stay fast.
+services:
+  - type: web
+    name: organo-healers-api
+    runtime: docker
+    dockerfilePath: ./apps/server/Dockerfile
+    dockerContext: .
+    region: singapore
+    plan: free # sleeps after 15 min idle; keep it awake with a free uptime ping (see README)
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_OPTIONS # cap Node's heap so Node + Chromium fit in 512 MB
+        value: --max-old-space-size=256
+      - key: DATABASE_URL # Neon pooled URL (see README for required parameters)
+        sync: false
+      - key: DIRECT_URL # Neon direct URL, used for migrations at startup
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: APP_URL # your Vercel URL, e.g. https://organo-healers.vercel.app
+        sync: false
+      - key: CORS_ORIGINS # same Vercel URL (comma-separate extra domains)
+        sync: false
+      - key: API_URL # this service's own URL, e.g. https://organo-healers-api.onrender.com
+        sync: false
+      - key: TRUST_PROXY # Vercel edge + Render load balancer
+        value: "2"
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_SENDER_EMAIL
+        sync: false
+      - key: BREVO_SENDER_NAME
+        value: Organo Healers
