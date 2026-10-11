@@ -1,14 +1,12 @@
-import { cookies } from "next/headers";
 import { AppHeader } from "@/components/shell/app-header";
 import { AppSidebar } from "@/components/shell/app-sidebar";
+import { AppSidebarProvider } from "@/components/shell/app-sidebar-provider";
 import { CommandMenuProvider } from "@/components/shell/command-menu";
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { SidebarInset } from "@/components/ui/sidebar";
 
-export default async function AppLayout({ children }: { children: React.ReactNode }) {
-  const store = await cookies();
-  const defaultOpen = store.get("sidebar_state")?.value !== "false";
+export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
-    <SidebarProvider defaultOpen={defaultOpen}>
+    <AppSidebarProvider>
       <CommandMenuProvider>
         <AppSidebar />
         <SidebarInset className="min-w-0">
@@ -16,6 +14,6 @@ export default async function AppLayout({ children }: { children: React.ReactNod
           <main className="flex min-h-0 flex-1 flex-col">{children}</main>
         </SidebarInset>
       </CommandMenuProvider>
-    </SidebarProvider>
+    </AppSidebarProvider>
   );
 }
