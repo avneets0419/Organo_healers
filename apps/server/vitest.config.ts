@@ -15,7 +15,9 @@ function loadEnv(file: string): Record<string, string> {
   }
 }
 
-const testEnv = loadEnv(".env.test");
+// Email stays unconfigured in tests even if .env has a real Brevo key
+// (empty counts as unset; .env loading never overrides existing values).
+const testEnv = { BREVO_API_KEY: "", BREVO_SENDER_EMAIL: "", ...loadEnv(".env.test") };
 // Applied before global setup so migrations/seed also target the test database.
 Object.assign(process.env, testEnv);
 
