@@ -3,7 +3,7 @@ import { DOCUMENT_TYPE_LABEL, formatPhone } from "@organo/shared";
 import { env } from "../../config/env";
 import { emailService } from "../../integrations/email/brevo.service";
 import { EmailNotConfiguredError, EmailProviderError } from "../../integrations/email/email.service";
-import { generateDocumentPdf, pdfFilename } from "../../integrations/pdf/pdf.service";
+import { documentPdf, pdfFilename } from "../../integrations/pdf/pdf.service";
 import { logActivity } from "../../lib/activity";
 import { ApiError } from "../../lib/http";
 import { logger } from "../../lib/logger";
@@ -38,6 +38,11 @@ export async function composeForDocument(id: string, userName?: string) {
   const link = publicLink(doc.publicToken);
   const vars = varsForDocument(r, link, { salesperson: settings.salespersonName ?? userName });
   const [emailT, waT] = await Promise.all([templatesFor("EMAIL", doc.type), templatesFor("WHATSAPP", doc.type)]);
+  // Opening the send dialog starts the PDF in the background (Chromium start-up
+  // is the slow part on small hosts), so Send only waits for the email provider.
+  if (emailService.configured && doc.status !== "CANCELLED") {
+    documentPdf(doc, () => r).catch((err) => logger.warn({ err, documentId: id }, "PDF prefetch failed"));
+  }
   const render = (ts: typeof emailT) => ts.map((t) => ({ key: t.key, name: t.name, isDefault: t.isDefault, ...renderPair(t, vars) }));
   return {
     number: doc.number,
@@ -71,10 +76,11 @@ export async function sendDocumentEmail(
   const r = toRenderable(doc);
   const link = publicLink(doc.publicToken);
 
+  const started = Date.now();
   let pdf: { name: string; base64: string } | null = null;
   if (input.attachPdf) {
     try {
-      pdf = { name: pdfFilename(r), base64: (await generateDocumentPdf(r)).toString("base64") };
+      pdf = { name: pdfFilename(r), base64: (await documentPdf(doc, () => r)).toString("base64") };
     } catch (err) {
       logger.error({ err, documentId: id }, "PDF generation failed for email");
       throw new ApiError(500, "Couldn't generate the PDF attachment. Try again, or send without the PDF.");
@@ -85,7 +91,9 @@ export async function sendDocumentEmail(
   const message = buildDocumentEmail({ doc: r, to: input.to, subject: input.subject, body: input.body, link, logoUrl, replyTo: settings.emailReplyTo ?? settings.email, pdf });
 
   try {
+    const pdfMs = Date.now() - started;
     const result = await emailService.send(message, settings.emailSenderName ?? settings.businessName);
+    logger.info({ documentId: id, pdfMs, providerMs: Date.now() - started - pdfMs }, "email sent");
     await prisma.$transaction(async (tx) => {
       await tx.messageLog.create({
         data: { channel: "EMAIL", status: "SENT", to: input.to, subject: input.subject, body: input.body, providerMessageId: result.messageId, documentId: id, customerId: doc.customerId, userId },

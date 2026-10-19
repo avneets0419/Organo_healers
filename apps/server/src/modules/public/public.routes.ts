@@ -6,7 +6,7 @@ import { prisma } from "../../lib/prisma";
 import { publicLimiter } from "../../middleware/rateLimit";
 import { syncCustomerStatus } from "../customers/customer-status";
 import { documentInclude, toRenderable } from "../documents/documents.service";
-import { generateDocumentPdf, pdfFilename } from "../../integrations/pdf/pdf.service";
+import { documentPdf, pdfFilename } from "../../integrations/pdf/pdf.service";
 import { logger } from "../../lib/logger";
 
 export const publicRouter = Router();
@@ -85,7 +85,7 @@ publicRouter.get(
     const r = toRenderable(doc);
     let pdf: Buffer;
     try {
-      pdf = await generateDocumentPdf(r);
+      pdf = await documentPdf(doc, () => r);
     } catch (err) {
       logger.error({ err }, "Public PDF generation failed");
       throw new ApiError(500, "Couldn't generate the PDF. Please try again.");

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { phoneInput } from "@organo/shared";
 import { z } from "zod";
-import { generateDocumentPdf, pdfFilename } from "../../integrations/pdf/pdf.service";
+import { documentPdf, pdfFilename } from "../../integrations/pdf/pdf.service";
 import { ApiError, handler, ok, param, parse } from "../../lib/http";
 import { logger } from "../../lib/logger";
 import { requirePermission } from "../../middleware/auth";
@@ -61,7 +61,7 @@ messagingRouter.get(
     const r = toRenderable(doc);
     let pdf: Buffer;
     try {
-      pdf = await generateDocumentPdf(r);
+      pdf = await documentPdf(doc, () => r);
     } catch (err) {
       logger.error({ err, documentId: doc.id }, "PDF generation failed");
       throw new ApiError(500, "Couldn't generate the PDF. Please try again.");

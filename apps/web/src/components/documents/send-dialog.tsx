@@ -110,10 +110,6 @@ function SendForm({ documentId, mode, onClose, preferWhatsAppTemplate, data, tit
   const logWhatsApp = useMutation({
     mutationFn: () => api.post(`/documents/${documentId}/whatsapp-opened`, { phone, message: waBody, templateKey: waTpl }),
   });
-  const sendEmail = useMutation({
-    mutationFn: () => api.post<{ messageId: string | null }>(`/documents/${documentId}/send-email`, { to: to.trim(), subject, body: emailBody, attachPdf }),
-  });
-
   async function submit() {
     // Open WhatsApp synchronously inside the click so popup blockers allow it.
     if (wantWhatsApp && waUrl) {
@@ -122,18 +118,24 @@ function SendForm({ documentId, mode, onClose, preferWhatsAppTemplate, data, tit
         onError: (e) => toast.error("WhatsApp opened, but the activity log failed", errorMessage(e)),
       });
     }
+    const refresh = () => {
+      for (const k of [["documents"], ["document", documentId], ["customers"], ["activities"], ["dashboard"]]) qc.invalidateQueries({ queryKey: k });
+    };
     if (wantEmail) {
-      try {
-        await sendEmail.mutateAsync();
-        toast.success(`Email sent to ${to.trim()}`, wantWhatsApp ? "WhatsApp opened in a new tab. Press send there to deliver it." : undefined);
-      } catch (e) {
-        toast.error("Email not sent", errorMessage(e));
-        return;
-      }
-    } else if (wantWhatsApp) {
-      toast.info("WhatsApp opened", "The message is ready in WhatsApp. Press send there to deliver it.");
+      // The email (PDF + provider) finishes in the background; the dialog closes
+      // right away so the POS is never blocked, and a toast reports the result.
+      const recipient = to.trim();
+      const sending = api.post<{ messageId: string | null }>(`/documents/${documentId}/send-email`, { to: recipient, subject, body: emailBody, attachPdf });
+      toast.promise(sending, {
+        loading: { title: `Sending email to ${recipient}…`, description: attachPdf ? "Attaching the PDF" : undefined },
+        success: { title: `Email sent to ${recipient}`, description: wantWhatsApp ? "WhatsApp opened in a new tab. Press send there to deliver it." : undefined },
+        error: (e) => ({ title: `Email to ${recipient} not sent`, description: `${errorMessage(e)} Open Send again to retry.` }),
+      });
+      sending.then(refresh, refresh);
+    } else {
+      if (wantWhatsApp) toast.info("WhatsApp opened", "The message is ready in WhatsApp. Press send there to deliver it.");
+      refresh();
     }
-    for (const k of [["documents"], ["document", documentId], ["customers"], ["activities"], ["dashboard"]]) qc.invalidateQueries({ queryKey: k });
     onClose();
   }
 
@@ -236,7 +238,7 @@ function SendForm({ documentId, mode, onClose, preferWhatsAppTemplate, data, tit
         </DialogPanel>
         <DialogFooter>
           <DialogClose render={<Button variant="ghost" />}>Cancel</DialogClose>
-          <Button onClick={submit} disabled={emailBlocked || waBlocked} loading={sendEmail.isPending}>
+          <Button onClick={submit} disabled={emailBlocked || waBlocked}>
             {mode === "email" ? (
               <>
                 <Mail /> Send email

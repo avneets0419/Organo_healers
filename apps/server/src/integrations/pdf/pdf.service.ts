@@ -166,6 +166,33 @@ async function printPdf(doc: RenderableDocument, html: string): Promise<Buffer> 
   }
 }
 
+/*
+ * Small cache of finished PDFs, keyed by document and its updatedAt. The send
+ * dialog prefetches the PDF when it opens, so pressing Send only waits for the
+ * email provider. Any edit changes updatedAt, so a stale PDF is never reused.
+ */
+const PDF_CACHE_TTL_MS = 10 * 60_000;
+const PDF_CACHE_MAX = 6;
+const pdfCache = new Map<string, { version: number; at: number; pdf: Promise<Buffer> }>();
+
+export function documentPdf(doc: { id: string; updatedAt: Date }, render: () => RenderableDocument): Promise<Buffer> {
+  const version = doc.updatedAt.getTime();
+  const hit = pdfCache.get(doc.id);
+  if (hit && hit.version === version && Date.now() - hit.at < PDF_CACHE_TTL_MS) return hit.pdf;
+  const started = Date.now();
+  const pdf = generateDocumentPdf(render()).then((buf) => {
+    logger.info({ documentId: doc.id, ms: Date.now() - started, kb: Math.round(buf.length / 1024) }, "pdf generated");
+    return buf;
+  });
+  pdf.catch(() => {
+    if (pdfCache.get(doc.id)?.pdf === pdf) pdfCache.delete(doc.id);
+  });
+  pdfCache.delete(doc.id);
+  pdfCache.set(doc.id, { version, at: Date.now(), pdf });
+  while (pdfCache.size > PDF_CACHE_MAX) pdfCache.delete(pdfCache.keys().next().value!);
+  return pdf;
+}
+
 export function pdfFilename(doc: RenderableDocument): string {
   const who = (doc.customer.name || "customer").replace(/[^A-Za-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 40);
   return `${doc.number ?? DOCUMENT_TYPE_LABEL[doc.type]}-${who}.pdf`;
