@@ -27,14 +27,14 @@ export async function generateMetadata({ params }: { params: Promise<{ token: st
   const d = data.document;
   const title = `${DOCUMENT_TYPE_LABEL[d.type]} ${d.number}`;
   const description = `${d.business.name}: ${formatINR(d.totals.grandTotal)} for ${d.customer.name}`;
-  // Shared links (WhatsApp, email) preview with the brand mark. Setting openGraph here
+  // Shared links (WhatsApp, email) preview with the full logo as a wide banner. Setting openGraph here
   // replaces the inherited one, so the image from app/opengraph-image.png is named again.
   return {
     title,
     description,
     robots: { index: false, follow: false },
-    openGraph: { title: `${title} · ${d.business.name}`, description, siteName: d.business.name, type: "website", images: [{ url: "/opengraph-image.png", width: 600, height: 600, alt: d.business.name }] },
-    twitter: { card: "summary" },
+    openGraph: { title: `${title} · ${d.business.name}`, description, siteName: d.business.name, type: "website", images: [{ url: "/opengraph-image.png", width: 1200, height: 630, alt: `${d.business.name} logo` }] },
+    twitter: { card: "summary_large_image" },
   };
 }
 
